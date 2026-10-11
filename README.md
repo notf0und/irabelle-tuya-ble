@@ -1,4 +1,19 @@
-# Home Assistant support for Tuya BLE devices
+# Irabelle Tuya BLE
+
+A fork of [patriot1889/ha_tuya_ble](https://github.com/patriot1889/ha_tuya_ble)
+(itself based on [markusg1234](https://github.com/markusg1234/ha_tuya_ble) and
+[PlusPlus-ua](https://github.com/PlusPlus-ua/ha_tuya_ble)) carrying one bug fix:
+a dropped BLE session used to leave the integration permanently unable to talk to
+the device — silently, while the entities kept showing their last values, and
+every button press blocked behind the connect lock.
+
+See [CHANGELOG.md](CHANGELOG.md) for the details. Upstream code is otherwise
+untouched, so it can be re-synced at any time:
+
+```sh
+git remote add upstream https://github.com/patriot1889/ha_tuya_ble
+git fetch upstream && git merge upstream/main
+```
 
 ## Overview
 
@@ -15,7 +30,10 @@ _This forks base is from https://github.com/markusg1234/ha_tuya_ble_
 
 Place the `custom_components` folder in your configuration directory (or add its contents to an existing `custom_components` folder). Alternatively install via [HACS](https://hacs.xyz/).
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=patriot1889&repository=ha_tuya_ble&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=notf0und&repository=irabelle-tuya-ble&category=integration)
+
+In HACS: **Custom repositories** → `https://github.com/notf0und/irabelle-tuya-ble`,
+category **Integration**, then search for *Irabelle Tuya BLE* and download.
 
 ## Usage
 

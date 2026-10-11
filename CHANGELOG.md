@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [0.1.10] - 2026-10-11
+
+### Fixed
+
+- Reconnect no longer leaks live BLE clients. Every failed attempt in
+  `_ensure_connected` used to drop the reference (`self._client = None`) and
+  open a new connection, leaving the previous client connected *and* still
+  subscribed to `CHARACTERISTIC_NOTIFY`. Each leaked client made the device's
+  notifications arrive one extra time, so the packet sequence numbers advanced
+  too far and the reassembly could never re-sync — the integration then sat
+  there timing out on every request while the entities kept their last values,
+  and any button press blocked behind the connect lock. The old client is now
+  stopped and disconnected (`_release_client`) before each retry.
+- A duplicate/out-of-range fragment no longer wipes the partial response in
+  `_notification_handler`; repeats are ignored, and only a genuine restart at
+  packet 0 starts the assembly over.
+
 ## [0.1.0] - 2023-04-22
 
 - Initial release

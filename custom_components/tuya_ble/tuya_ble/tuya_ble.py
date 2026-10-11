@@ -536,6 +536,35 @@ class TuyaBLEDevice:
         async with self._seq_num_lock:
             self._current_seq_num = 1
 
+    async def _release_client(self) -> None:
+        """Disconnect the current client, notification subscription included.
+
+        The retry loop in _ensure_connected used to do `self._client = None`
+        and try again, which left the previous BleakClient connected *and*
+        still subscribed to CHARACTERISTIC_NOTIFY. Every leaked client makes
+        the device's notifications arrive one extra time, so the packet
+        sequence numbers advance too far and the reassembly can never
+        re-sync ("Missing packet (number 0) ... received 5" forever).
+        Release the client properly before each retry instead.
+        """
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        try:
+            if client.is_connected:
+                try:
+                    await client.stop_notify(CHARACTERISTIC_NOTIFY)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.wait_for(client.disconnect(), timeout=10)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "%s: releasing the previous client failed",
+                self.address,
+                exc_info=True,
+            )
+
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
         global global_connect_lock
@@ -605,7 +634,7 @@ class TuyaBLEDevice:
                             CHARACTERISTIC_NOTIFY, self._notification_handler
                         )
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
+                        await self._release_client()
                         _LOGGER.error("%s: starting notifications failed",
                                       self.address, exc_info=True)
                         continue
@@ -622,14 +651,14 @@ class TuyaBLEDevice:
                             0,
                             True,
                         ):
-                            self._client = None
+                            await self._release_client()
                             _LOGGER.error(
                                 "%s: Sending device info request failed",
                                 self.address,
                             )
                             continue
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
+                        await self._release_client()
                         _LOGGER.error("%s: Sending device info request failed",
                                       self.address, exc_info=True)
                         continue
@@ -645,14 +674,14 @@ class TuyaBLEDevice:
                             0,
                             True,
                         ):
-                            self._client = None
+                            await self._release_client()
                             _LOGGER.error(
                                 "%s: Sending pairing request failed",
                                 self.address,
                             )
                             continue
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
+                        await self._release_client()
                         _LOGGER.error("%s: Sending pairing request failed",
                                       self.address, exc_info=True)
                         continue
@@ -1243,11 +1272,25 @@ class TuyaBLEDevice:
         packet_num, pos = self._unpack_int(data, pos)
 
         if packet_num < self._input_expected_packet_num:
-            _LOGGER.error(
-                "%s: Unexpcted packet (number %s) in notifications, " "expected %s",
+            if packet_num != 0:
+                # A fragment we already have. Duplicate deliveries are what a
+                # leaked notification subscription looks like (the same packet
+                # several times in the same millisecond). Wiping the partial
+                # response here is what made that state unrecoverable, so just
+                # ignore the repeat.
+                _LOGGER.debug(
+                    "%s: Duplicate packet (number %s) ignored; RSSI: %s",
+                    self.address,
+                    packet_num,
+                    self.rssi,
+                )
+                return
+            # A new response starts at packet 0 while the previous one was
+            # still incomplete: start over.
+            _LOGGER.debug(
+                "%s: Restarting response assembly at packet 0; RSSI: %s",
                 self.address,
-                packet_num,
-                self._input_expected_packet_num,
+                self.rssi,
             )
             self._clean_input()
 
