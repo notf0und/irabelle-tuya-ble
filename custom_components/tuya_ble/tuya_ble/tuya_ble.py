@@ -45,6 +45,12 @@ _LOGGER = logging.getLogger(__name__)
 
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
 
+# Pause between failed connection attempts in _ensure_connected (grows per
+# consecutive failure). Without it a device that can't be reached was retried
+# several times a second, forever.
+CONNECT_RETRY_BACKOFF = 0.5
+CONNECT_RETRY_BACKOFF_MAX = 5.0
+
 
 class TuyaBLEDataPoint:
     def __init__(
@@ -224,6 +230,7 @@ class TuyaBLEDevice:
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._expected_disconnect = False
+        self._reconnect_task: asyncio.Task | None = None
         self._connected_callbacks: list[Callable[[], None]] = []
         self._callbacks: list[Callable[[list[TuyaBLEDataPoint]], None]] = []
         self._disconnected_callbacks: list[Callable[[], None]] = []
@@ -499,7 +506,11 @@ class TuyaBLEDevice:
             )
             self._fire_disconnected_callbacks()
             return
-        self._client = None
+        if self._client is client:
+            self._client = None
+        # The device dropped the connection, but bleak keeps this client's own
+        # D-Bus connection open until disconnect() is called - release it.
+        asyncio.create_task(self._close_client(client))
         _LOGGER.warning(
             "%s: Device unexpectedly disconnected; RSSI: %s",
             self.address,
@@ -510,7 +521,18 @@ class TuyaBLEDevice:
             self.address,
             self.rssi,
         )
-        asyncio.create_task(self._reconnect())
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Start a reconnect unless one is already pending or running.
+
+        Several paths (unexpected disconnects, failed sends) used to start
+        their own reconnect chain, and each chain re-scheduled itself on
+        failure, so an unreachable device ended up with many parallel loops.
+        """
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect())
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -530,9 +552,7 @@ class TuyaBLEDevice:
             client = self._client
             self._expected_disconnect = True
             self._client = None
-            if client and client.is_connected:
-                await client.stop_notify(CHARACTERISTIC_NOTIFY)
-                await client.disconnect()
+            await self._close_client(client)
         async with self._seq_num_lock:
             self._current_seq_num = 1
 
@@ -549,6 +569,20 @@ class TuyaBLEDevice:
         """
         client = self._client
         self._client = None
+        await self._close_client(client)
+
+    async def _close_client(self, client: BleakClientWithServiceCache | None) -> None:
+        """Fully release a client, including its own D-Bus connection.
+
+        bleak's BlueZ backend opens a new system D-Bus connection for every
+        connection session and only closes it in disconnect() - also when the
+        device has already disconnected by itself. Skipping disconnect() for a
+        client that is no longer connected leaks one D-Bus connection per
+        session. Once the bus limit is reached (max_connections_per_user,
+        usually 256) every Bluetooth connection in Home Assistant fails
+        instantly with EOFError. disconnect() on an already-disconnected client
+        is safe: it just closes the D-Bus connection.
+        """
         if client is None:
             return
         try:
@@ -557,10 +591,10 @@ class TuyaBLEDevice:
                     await client.stop_notify(CHARACTERISTIC_NOTIFY)
                 except Exception:  # noqa: BLE001
                     pass
-                await asyncio.wait_for(client.disconnect(), timeout=10)
+            await asyncio.wait_for(client.disconnect(), timeout=10)
         except Exception:  # noqa: BLE001
             _LOGGER.debug(
-                "%s: releasing the previous client failed",
+                "%s: releasing the client failed",
                 self.address,
                 exc_info=True,
             )
@@ -585,6 +619,7 @@ class TuyaBLEDevice:
             if self._client and self._client.is_connected and self._is_paired:
                 return
             attempts_count = 100
+            failures = 0
             while attempts_count > 0:
                 attempts_count -= 1
                 if attempts_count == 0:
@@ -594,6 +629,11 @@ class TuyaBLEDevice:
                         self.rssi,
                     )
                     raise BleakNotFoundError()
+                if failures:
+                    await asyncio.sleep(
+                        min(CONNECT_RETRY_BACKOFF * failures, CONNECT_RETRY_BACKOFF_MAX)
+                    )
+                failures += 1
                 try:
                     async with global_connect_lock:
                         _LOGGER.debug(
@@ -639,6 +679,8 @@ class TuyaBLEDevice:
                                       self.address, exc_info=True)
                         continue
                 else:
+                    # Not connected, but it may still hold its D-Bus connection.
+                    await self._close_client(client)
                     continue
 
                 if self._client and self._client.is_connected:
@@ -703,26 +745,31 @@ class TuyaBLEDevice:
             _LOGGER.error("%s: No client device", self.address)
 
     async def _reconnect(self) -> None:
-        """Attempt a reconnect"""
-        _LOGGER.debug("%s: Reconnect, ensuring connection", self.address)
-        async with self._seq_num_lock:
-            self._current_seq_num = 1
-        try:
-            if self._expected_disconnect:
+        """Attempt a reconnect, retrying until connected or stopped.
+
+        Retries in this task instead of scheduling a new one, so a device
+        never has more than one reconnect loop (see _schedule_reconnect).
+        """
+        while True:
+            _LOGGER.debug("%s: Reconnect, ensuring connection", self.address)
+            async with self._seq_num_lock:
+                self._current_seq_num = 1
+            try:
+                if self._expected_disconnect:
+                    return
+                await self._ensure_connected()
+                if self._expected_disconnect:
+                    return
+                _LOGGER.debug("%s: Reconnect, connection ensured", self.address)
                 return
-            await self._ensure_connected()
-            if self._expected_disconnect:
-                return
-            _LOGGER.debug("%s: Reconnect, connection ensured", self.address)
-        except BLEAK_EXCEPTIONS:  # BleakNotFoundError:
-            _LOGGER.debug(
-                "%s: Reconnect, failed to ensure connection - backing off",
-                self.address,
-                exc_info=True,
-            )
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            _LOGGER.debug("%s: Reconnecting again", self.address)
-            asyncio.create_task(self._reconnect())
+            except BLEAK_EXCEPTIONS:  # BleakNotFoundError:
+                _LOGGER.debug(
+                    "%s: Reconnect, failed to ensure connection - backing off",
+                    self.address,
+                    exc_info=True,
+                )
+                await asyncio.sleep(BLEAK_BACKOFF_TIME)
+                _LOGGER.debug("%s: Reconnecting again", self.address)
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -953,7 +1000,7 @@ class TuyaBLEDevice:
             if self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             raise BleakError from ex
         except BleakError as ex:
             # Disconnect so we can reset state and try again
@@ -966,7 +1013,7 @@ class TuyaBLEDevice:
             if self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             raise
 
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
