@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [0.1.11] - 2026-11-07
+
+### Fixed
+
+- D-Bus connection leak that eventually broke **all** Bluetooth in Home
+  Assistant. bleak's BlueZ backend opens a dedicated system D-Bus connection
+  for every connection session and only closes it in `disconnect()` — also
+  when the device has already dropped the connection itself. The integration
+  skipped `disconnect()` for clients that were no longer connected: when a
+  device disconnected unexpectedly (`_disconnected` only forgot the client),
+  in `_release_client` and in `_execute_disconnect`. One D-Bus connection
+  leaked per dropped session; after about a day Home Assistant held 245 of
+  the 256 allowed (`max_connections_per_user`), dbus-daemon refused every new
+  connection, and every BLE connect failed instantly with `EOFError` — a
+  Fingerbot press did nothing. All paths now go through `_close_client`, which
+  always calls `disconnect()`.
+- Only one reconnect loop per device. Unexpected disconnects and failed sends
+  each started their own `_reconnect` chain, and each chain re-scheduled
+  itself on failure; `_reconnect` now retries in its own task and new requests
+  join the running one (`_schedule_reconnect`).
+- Failed connection attempts in `_ensure_connected` back off (0.5 s, growing
+  to 5 s) instead of retrying back to back; an unreachable device was retried
+  several times a second.
+
+### Added
+
+- `tests/test_connection_cleanup.py` (no Home Assistant needed:
+  `python -m pytest tests/` with bleak, bleak-retry-connector, pycryptodome
+  and pytest-asyncio).
+
 ## [0.1.10] - 2026-10-11
 
 ### Fixed
